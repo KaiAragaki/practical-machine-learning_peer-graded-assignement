@@ -2,7 +2,7 @@ library(targets)
 
 source("functions.R")
 
-tar_option_set(packages = c("tidyverse", "tidymodels", "clock"))
+tar_option_set(packages = c("tidyverse", "tidymodels"))
 
 # End this file with a list of target objects.
 list(
