@@ -23,5 +23,7 @@ list(
   tar_target(exam_tidied, filter(both_tidied, dataset == "exam")),
   tar_target(partition, initial_split(data_tidied, prop = 0.8, strata = "classe")),
   tar_target(train, training(partition)),
-  tar_target(test, testing(partition))
+  tar_target(test, testing(partition)),
+  tar_target(model_spec, make_model_spec()),
+  tar_target(model_fit, model_spec |> fit(classe ~ ., data = train))
 )
