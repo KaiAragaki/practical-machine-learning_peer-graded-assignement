@@ -20,7 +20,8 @@ tidy_both <- function(data) {
     mutate(time = raw_timestamp_part_1 * 1000000 + raw_timestamp_part_2) |> 
     select(-c(raw_timestamp_part_1, raw_timestamp_part_2)) |> 
     group_by(user_name) |> 
-    mutate(time = time - min(time))
+    mutate(time = time - min(time),
+           classe = as.factor(classe)) 
     #...1 is a row ID col
     # timestamps have been compressed into a single feature
     # rest contain no data
@@ -38,3 +39,12 @@ make_model_spec <- function() {
     set_mode('classification')
 }
 
+make_recipe <- function() {
+  
+}
+
+make_workflow <- function(model) {
+  workflow() |> 
+    add_model(model) |> 
+    add_formula(classe ~ yaw_belt)
+}
