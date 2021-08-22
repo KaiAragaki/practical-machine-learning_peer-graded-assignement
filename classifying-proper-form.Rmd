@@ -1,0 +1,369 @@
+---
+title: "Classifying Proper Form in Exercise using Wearable Data"
+output: tufte::tufte_html
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+# Setup
+
+This report was written using `targets`. It requires `targets`, `knitr`, the `tidyverse`, `tidymodels`, and `xgboost` to be installed.
+
+```{r message=FALSE}
+library(targets)
+library(knitr)
+library(tidyverse)
+tar_unscript()
+```
+
+# Preparing Workspace
+
+```{targets set-options, tar_globals = TRUE}
+tar_option_set(packages = c("tidyverse", "tidymodels"))
+```
+
+Let's create some directories that we'll put our data into:
+
+```{targets make-dir, tar_globals = TRUE}
+make_dir <- function(path) {
+  if (!dir.exists(path)) {
+    dir.create(path)
+  }
+  path
+}
+```
+
+```{targets data-dir}
+tar_target(data_dir, make_dir("../01_data"), format = "file")
+```
+
+# Obtaining Data
+
+These data are from [Velloso et al, 2013](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har) and are kindly licensed under CC BY-SA license.
+
+We first download our data file^[While it is named 'training' from the source, this may not be the best way to think about these data. Therefore, we have named it simply 'data', for reasons that will become apparent later.
+]:
+
+```{targets get-file, tar_globals = TRUE}
+get_file <- function(url, file_name, data_dir) {
+  dest_file <- paste0(data_dir, "/", file_name)
+  download.file(url, destfile = dest_file)
+  dest_file
+}
+```
+
+```{targets data-file}
+tar_target(data_file, 
+           get_file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+                    "data.csv", 
+                    data_dir),
+           format = "file")
+```
+
+
+Additionally, we need to get our 'testing' data, which I will rename as 'exam' data:
+
+```{targets exam-file}
+tar_target(exam_file, 
+           get_file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                    "exam.csv",
+                    data_dir),
+           format = "file")
+```
+
+These are fairly tidy data, I have found doing EDA (not shown), so they require very little modification to read in nicely:
+
+```{targets read-file, tar_globals = TRUE}
+read_file <- function(file_path) {
+  read_csv(file_path, na = c("#DIV/0!", "NA"))
+}
+```
+
+```{targets read-data}
+tar_target(data, read_file(data_file))
+```
+
+```{targets read-exam}
+tar_target(exam, read_file(exam_file))
+```
+
+
+# Feature Selection
+
+This is where things are going to get a little weird. For this project, we are required to predict the `classe` feature of this dataset^[The classe feature has the values A through E, each which refer to a different method of lifting a dumbell. Class A is considered 'good form', while B-E are considered 'bad form', each in their own way]. In the context of this study, we would typically be interested if determining if a given repetition was done properly or not, and we would typically have access to the accelorometer data for the entire rep. However, if we take a look at the exam data:
+
+```{r}
+tar_make()
+```
+
+
+```{r}
+tar_read(exam)[1:7] |> kable()
+```
+
+We note that there are very few data points, and they are not in 'time windows', so we cannot do the windowed averaging to generate euclidean angle summary statistics (kurtosis_roll belt, etc) as was done in the associated paper. While it is typically discouraged to look at our testing data to determine how to generate our model, these 'exam' data are not representative of data we would seek to predict the class of in the wild. That said, we will remove all features in our training data that do not have values in our exam data.
+
+```{targets find-na-features, tar_globals = TRUE}
+find_na_features <- function(data) {
+  na_sums <- apply(data, 2, function(x) is.na(x) |> sum())
+  which(na_sums == nrow(data)) |> names()
+}
+```
+
+```{targets na-features}
+tar_target(na_features, find_na_features(exam))
+```
+
+```{targets rm-na-cols, tar_globals = TRUE}
+rm_na_cols <- function(data, na_features) {
+  data[, !(colnames(data) %in% na_features)]
+}
+```
+
+```{targets rm-nas-data}
+tar_target(data_no_na, rm_na_cols(data, na_features))
+```
+
+```{targets rm-nas-exam}
+tar_target(exam_no_na, rm_na_cols(exam, na_features))
+```
+
+```{r}
+tar_make()
+```
+
+```{r}
+tar_read(data_no_na)[1:6] |> head() |> kable()
+```
+
+A few other features I'm removing:
+
+* The `...1` feature is simply a row ID feature that offers no useful information.
+* The `new_window` and `num_window` features are vestiges of the windowed time-frame analysis the authors used. Since (as I've mentioned above) our case is significantly different, we can remove those to no loss.
+
+Some may be a bit more controversial, but to me make this analysis a bit more realistic and fun:
+
+* I'm going to remove all time data. Thinking about this, if we supply time data we may be inadvertently building a model that instead just tries to match what time this event came from, then find its answer by essentially fitting the 'freeze frame' puzzle piece back into the action as a whole. This isn't really useful in the real world. I want to build a model that can take a 'freeze frame' of someone performing a rep, and tell me if they are doing it right or not - without any additional information.
+
+* Building off of that, I'm also going to remove the `user_name` feature. I am going to attempt to make this model user agnostic. This could end horribly - we'll see!
+
+```{targets rm_features, tar_globals = TRUE}
+also_rm <- function(data) {
+  to_rm <- c("...1", 
+             "user_name",
+             "raw_timestamp_part_1", 
+             "raw_timestamp_part_2", 
+             "cvtd_timestamp", 
+             "new_window", 
+             "num_window")
+  data[, !(colnames(data) %in% to_rm)]
+}
+```
+
+```{targets finalize-data}
+tar_target(data_final, also_rm(data_no_na))
+```
+
+```{targets finalize-exam}
+tar_target(exam_final, also_rm(exam_no_na))
+```
+
+```{r, include = FALSE}
+tar_make()
+```
+
+```{r}
+dim(tar_read(data_final))
+```
+
+53 features vs the 160 we started with - this is much more tractable!
+
+# Model Training
+
+Before we even begin to train our model, we first need a training set! Remember before how I called our 'training' set a *data* set - this is because our 'testing' set is a measly 20 observations, and is more of a validation set regardless. We must make our own training and testing datasets:
+
+```{targets, part-data}
+tar_target(partition, initial_split(data_final, prop = 0.7, strata = "classe"))
+```
+
+I decided to spend 70% of these data for training, and leave the rest for testing. Further, I've decided to evenly sample from each of our strata to ensure class balance (there is very little downside to stratifying our data when splitting, so it can only help)
+
+```{targets, training}
+tar_target(train, training(partition))
+```
+
+```{targets, testing}
+tar_target(test, testing(partition))
+```
+
+## Model Tuning
+
+I've decided to use `xgboost` for predictions. `xgboost` is boosted-tree method, and is very good at making predictions while also requiring very little preprocessing. However, there are some hyperparameters we need to tune. Fortunately, the `dials` package from `tidymodels` makes this dead simple
+
+```{targets define-model, tar_globals = TRUE}
+define_model <- function(){
+  boost_tree(
+    tree_depth = tune(),
+    learn_rate = tune(),
+    min_n = tune(),
+    loss_reduction = tune()) |> 
+    set_engine('xgboost') |> 
+    set_mode('classification')
+}
+```
+
+Tidymodels uses recipes. Recipes define a series of preprocessing steps that can be applied to both training and testing data separately, to prevent data-leakage. Really, the only thing I'm going to change here is changing the outcome to factors, what xgboost expects. `skip = TRUE` means that while this will be applied to training data, it won't be applied to testing data. If I did not supply this step, it would not be applied to the outcome variable (since the presence of the outcome variable cannot be assured in testing data).
+
+```{targets define-recipe, tar_globals = TRUE}
+define_recipe <- function(train){
+  recipe(classe ~ ., data = train) |> 
+    step_string2factor(all_nominal(), skip = TRUE)
+}
+```
+
+```{targets model}
+tar_target(model, define_model())
+```
+
+```{targets recipe}
+tar_target(recipe, define_recipe(train))
+```
+
+These are packaged neatly into a 'workflow', which is an object type that seeks to encompass the entirety of the modeling process (pre-processing as well as modeling).
+
+```{targets workflow}
+tar_target(wf, 
+           workflow() |>
+             add_model(model) |> 
+             add_recipe(recipe)
+)
+```
+
+I then extract the parameters I'm going to be tuning...
+
+```{targets workflow-params}
+tar_target(wf_params, wf |> parameters())
+```
+
+...and then I choose 15 more or less evenly distributed points across the default parameter hyperspace. Basically, I have 15 combinations of my hyperparameters that cover a varied combination of values they can take on.
+
+```{targets make-grid}
+set.seed(40)
+tar_target(wf_grid, wf_params |> grid_max_entropy(size = 15))
+```
+
+To get an estimate of how well one set of hyperparameters performs over the other, I'm doing crossfold validation (with a default of 10 folds)
+
+```{targets make-folds}
+tar_target(train_folds, vfold_cv(train))
+```
+
+```{targets tune-grid, tar_globals = TRUE}
+grid_tuner <- function(wf, folds, grid) {
+  wf |> 
+    tune_grid(folds,
+              grid = grid)
+}
+```
+
+
+```{targets tuned-grid}
+set.seed(20)
+tar_target(tuned_grid, 
+           grid_tuner(wf, train_folds, wf_grid))
+```
+
+```{targets best-fits}
+tar_target(best_fits, tuned_grid |> show_best(metric = "accuracy"))
+```
+
+
+```{r include = FALSE}
+tar_make()
+```
+
+After tuning our grid, we find that a faster learning rate seems to do better. Other hyperparameters might also be important, but no trends are really jumping out. We could make a bigger grid, but a larger grid means more time, and this analysis already takes around ~10 minutes, and I'm quite impatient. Also, a ~95% accuracy is pretty good.
+
+```{r}
+tar_read(best_fits)
+```
+
+## Model Fitting
+
+We choose the best model (by the accuracy metric) and finalize our model by setting the hyperparameters to be those of our best shot.
+
+```{targets finalize-model}
+tar_target(final_model, wf |> finalize_workflow(select_best(tuned_grid, metric = "accuracy")))
+```
+
+
+```{r include = FALSE}
+tar_make()
+```
+
+Then, we fit our model.
+
+```{targets fit-model}
+tar_target(xg_fit, fit(final_model, train))
+```
+
+# Model Testing
+
+Models can essentially 'memorize' their data, to the point where they are 100% accurate on their training data. This makes them more fragile when we show them new data, however. To truly test if we got it right, we need to test this fit model against our testing data.
+
+```{targets predict}
+tar_target(predictions, predict(xg_fit, test |> select(-classe)))
+```
+
+```{r include = FALSE}
+tar_make()
+```
+
+
+
+```{targets determine_accuracy}
+tar_target(model_acc, bind_cols(test, predictions) |> 
+             mutate(classe = as.factor(classe)) |> 
+             accuracy(classe, .pred_class))
+```
+
+```{r include = FALSE}
+tar_make()
+```
+
+Our predictions are pretty accurate still! Looks like we didn't overfit.
+
+```{r}
+tar_read(model_acc)
+```
+
+# Exam Results
+
+Finally, we can use our tried and true model to generate predictions for the 'exam' data:
+
+```{targets exam-results}
+tar_target(exam_results, 
+           predict(xg_fit, exam_final) |> bind_cols(exam_final))
+```
+
+```{r include = FALSE}
+tar_make()
+```
+
+
+```{r}
+tar_read(exam_results) |> 
+  select(.pred_class, problem_id) |> 
+  kable()
+```
+
+
+# Targets Network
+
+These are all the target nodes in this report - you can see how they depend and flow with one another.
+
+```{r}
+tar_visnetwork()
+```
